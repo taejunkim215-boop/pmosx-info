@@ -1,0 +1,164 @@
+name: TEMP AVGO earnings originals relay
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/temp-avgo-earnings-relay.yml
+
+permissions:
+  contents: write
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: tmp-avgo-earnings-20261031
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install parser
+        run: python -m pip install --quiet requests beautifulsoup4
+
+      - name: Fetch Broadcom SEC EX-99.1 originals
+        shell: bash
+        run: |
+          python - <<'PY'
+          import hashlib, json, re, time
+          from pathlib import Path
+          import requests
+          from bs4 import BeautifulSoup
+
+          CIK = "0001730168"
+          CIK_INT = str(int(CIK))
+          OUT = Path("tmp_avgo_earnings")
+          OUT.mkdir(exist_ok=True)
+          UA = "PMOS-X earnings-originals collector research contact"
+
+          def get_json(url):
+              r = requests.get(url, headers={"User-Agent": UA, "Accept-Encoding": "gzip, deflate"}, timeout=30)
+              r.raise_for_status()
+              time.sleep(0.15)
+              return r.json()
+
+          def get_bytes(url):
+              r = requests.get(url, headers={"User-Agent": UA, "Accept-Encoding": "gzip, deflate"}, timeout=30)
+              r.raise_for_status()
+              time.sleep(0.15)
+              return r.content
+
+          root = get_json(f"https://data.sec.gov/submissions/CIK{CIK}.json")
+          datasets = [root["filings"]["recent"]]
+          for item in root["filings"].get("files", []):
+              name = item.get("name")
+              if name:
+                  datasets.append(get_json("https://data.sec.gov/submissions/" + name))
+
+          records = []
+          for d in datasets:
+              n = len(d.get("accessionNumber", []))
+              for i in range(n):
+                  items_arr = d.get("items", [])
+                  records.append({
+                      "accession": d["accessionNumber"][i],
+                      "filingDate": d["filingDate"][i],
+                      "form": d["form"][i],
+                      "items": items_arr[i] if i < len(items_arr) else "",
+                  })
+
+          candidates = {}
+          manifest = []
+          for rec in records:
+              if rec["form"] != "8-K" or not ("2021-01-01" <= rec["filingDate"] <= "2026-10-31"):
+                  continue
+              if "2.02" not in str(rec["items"]):
+                  continue
+              acc = rec["accession"]
+              acc_nodash = acc.replace("-", "")
+              base = f"https://www.sec.gov/Archives/edgar/data/{CIK_INT}/{acc_nodash}/"
+              index_url = base + f"{acc}-index.html"
+              soup = BeautifulSoup(get_bytes(index_url), "html.parser")
+              exhibit_url = exhibit_name = None
+              for tr in soup.find_all("tr"):
+                  tds = tr.find_all("td")
+                  if not tds:
+                      continue
+                  joined = " | ".join(" ".join(td.stripped_strings) for td in tds).upper()
+                  if "EX-99.1" not in joined:
+                      continue
+                  link = tr.find("a", href=True)
+                  if not link:
+                      continue
+                  href = link["href"]
+                  exhibit_name = href.rsplit("/", 1)[-1]
+                  exhibit_url = href if href.startswith("http") else ("https://www.sec.gov" + href if href.startswith("/") else base + href)
+                  break
+              if not exhibit_url:
+                  continue
+
+              raw = get_bytes(exhibit_url)
+              norm = re.sub(r"\s+", " ", BeautifulSoup(raw, "html.parser").get_text(" ", strip=True))
+              low = norm.lower()
+              if "broadcom" not in low or "financial results" not in low:
+                  continue
+
+              q = fy = None
+              m = re.search(r"\b(first|second|third) quarter fiscal year\s+(20\d{2})\b", low, re.I)
+              if m:
+                  q = {"first":1,"second":2,"third":3}[m.group(1).lower()]
+                  fy = int(m.group(2))
+              else:
+                  m = re.search(r"\bfourth quarter(?:\s+and)? fiscal year\s+(20\d{2})\b", low, re.I)
+                  if m:
+                      q, fy = 4, int(m.group(1))
+              if not fy or not q:
+                  continue
+              key = f"{fy}Q{q}"
+              if fy < 2021 or fy > 2026 or (fy == 2026 and q > 3):
+                  continue
+              if key in candidates:
+                  raise SystemExit(f"DUPLICATE_QUARTER {key}")
+
+              ext = Path(exhibit_name or "release.htm").suffix.lower()
+              if ext not in {".htm", ".html", ".txt", ".pdf"}:
+                  ext = ".htm"
+              filename = f"AVGO_FY{fy}_Q{q}_Earnings_Release_SEC_EX99_1{ext}"
+              (OUT / filename).write_bytes(raw)
+              meta = {
+                  "key": key, "fy": fy, "quarter": q,
+                  "filing_date": rec["filingDate"], "accession": acc,
+                  "source_url": exhibit_url, "sec_exhibit_name": exhibit_name,
+                  "filename": filename, "bytes": len(raw),
+                  "sha256": hashlib.sha256(raw).hexdigest(),
+              }
+              candidates[key] = meta
+              manifest.append(meta)
+
+          expected = [f"{y}Q{q}" for y in range(2021, 2027) for q in range(1,5) if y < 2026 or q <= 3]
+          missing = [k for k in expected if k not in candidates]
+          extra = sorted(set(candidates) - set(expected))
+          if missing or extra or len(candidates) != 23:
+              raise SystemExit(json.dumps({"status":"FAIL","count":len(candidates),"missing":missing,"extra":extra,"found":sorted(candidates)}, indent=2))
+
+          manifest.sort(key=lambda x: (x["fy"], x["quarter"]))
+          (OUT / "manifest.json").write_text(json.dumps({
+              "ticker":"AVGO","company":"Broadcom Inc.","source":"SEC 8-K EX-99.1",
+              "count":len(manifest),"quarters":manifest
+          }, indent=2), encoding="utf-8")
+          print(json.dumps({"status":"PASS","count":len(manifest),"keys":[x["key"] for x in manifest]}))
+          PY
+
+      - name: Commit relay files to temporary branch
+        shell: bash
+        run: |
+          git config user.name "pmosx-temp-relay"
+          git config user.email "actions@users.noreply.github.com"
+          git add tmp_avgo_earnings
+          git commit -m "TEMP relay AVGO FY2021Q1-FY2026Q3 SEC earnings originals"
+          git push origin HEAD:tmp-avgo-earnings-20261031
