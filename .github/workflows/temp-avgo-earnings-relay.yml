@@ -19,7 +19,7 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Fetch Broadcom official IR PDFs
+      - name: Install HTTP client\n        run: python -m pip install --quiet requests==2.32.5\n\n      - name: Fetch Broadcom official IR PDFs
         shell: bash
         run: |
           python - <<'PY'
